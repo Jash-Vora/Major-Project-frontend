@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
 
 type ApiResults = {
   success?: boolean;
@@ -27,6 +26,12 @@ type FrameAnalysis = NonNullable<NonNullable<ApiResults['results']>['frame_analy
 type DetectedObject = NonNullable<FrameAnalysis['objects']>[number];
 
 type StatusType = 'loading' | 'success' | 'error' | null;
+
+interface RealTimeResult {
+  timestamp: number;
+  answer: string;
+  question: string;
+}
 
 interface VideoAnalyzerProps {
   onBack?: () => void;
@@ -57,14 +62,11 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const stopRequestedRef = useRef<boolean>(false);
-  const forceStopTimeoutRef = useRef<number | null>(null);
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [realTimeAnalysis, setRealTimeAnalysis] = useState<any[]>([]);
-  const [isStreaming, setIsStreaming] = useState<boolean>(false);
-  const [livePredictions, setLivePredictions] = useState<string[]>([]);
 
-  const socketRef = useRef<Socket | null>(null);
+  // ── FIXED: single unified real-time results list ──
+  const [realTimeResults, setRealTimeResults] = useState<RealTimeResult[]>([]);
+  const [isStreaming, setIsStreaming] = useState<boolean>(false);
+  const [streamError, setStreamError] = useState<string>('');
 
   const dropZoneRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -74,54 +76,33 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingIntervalRef = useRef<number | null>(null);
   const streamingIntervalRef = useRef<number | null>(null);
-  const frameCounterRef = useRef<number>(0);
   const startTimeRef = useRef<number | null>(null);
+
+  // Track whether a frame analysis is already in-flight to avoid overlapping requests
+  const frameInFlightRef = useRef<boolean>(false);
 
   useEffect(() => {
     const saved = localStorage.getItem('apiUrl');
-    if (saved) {
-      setApiUrl(saved);
-    } else {
-      setApiUrl('http://localhost:5000');
-    }
+    setApiUrl(saved || 'http://localhost:5000');
   }, []);
 
   useEffect(() => {
-    if (apiUrl) {
-      localStorage.setItem('apiUrl', apiUrl);
-    }
+    if (apiUrl) localStorage.setItem('apiUrl', apiUrl);
   }, [apiUrl]);
 
+  // Keep camera preview in sync with stream
   useEffect(() => {
     const videoEl = cameraVideoRef.current;
-    if (!videoEl) return;
-    if (!mediaStream) return;
-
+    if (!videoEl || !mediaStream) return;
     if (videoEl.srcObject !== mediaStream) {
       videoEl.srcObject = mediaStream;
     }
-
     const tryPlay = async () => {
-      try {
-        await videoEl.play();
-      } catch (e) {
-        console.warn('Camera preview play() failed:', e);
-      }
+      try { await videoEl.play(); } catch (e) { console.warn('Camera play() failed:', e); }
     };
-
-    if (videoEl.readyState >= 2) {
-      void tryPlay();
-    } else {
-      videoEl.onloadedmetadata = () => {
-        void tryPlay();
-      };
-    }
-
-    return () => {
-      if (videoEl.onloadedmetadata) {
-        videoEl.onloadedmetadata = null;
-      }
-    };
+    if (videoEl.readyState >= 2) { void tryPlay(); }
+    else { videoEl.onloadedmetadata = () => { void tryPlay(); }; }
+    return () => { if (videoEl.onloadedmetadata) videoEl.onloadedmetadata = null; };
   }, [mediaStream, isCameraActive, isRecording]);
 
   const summaryText = useMemo(() => {
@@ -144,24 +125,16 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const videoInfo = results?.results?.video_processing_info;
 
-  const onDropZoneClick = () => {
-    fileInputRef.current?.click();
-  };
+  const onDropZoneClick = () => fileInputRef.current?.click();
 
   const onFileChosen = (file: File) => {
-    if (!file.type.startsWith('video/')) {
-      alert('⚠️ Please select a valid video file');
-      return;
-    }
+    if (!file.type.startsWith('video/')) { alert('⚠️ Please select a valid video file'); return; }
     if (file.size > 500 * 1024 * 1024) {
-      const cont = confirm('⚠️ This file is large and may take long to upload/process. Continue?');
-      if (!cont) return;
+      if (!confirm('⚠️ This file is large and may take long to process. Continue?')) return;
     }
     setSelectedFile(file);
     setResultsVisible(false);
-    if (previewVideoRef.current) {
-      previewVideoRef.current.src = URL.createObjectURL(file);
-    }
+    if (previewVideoRef.current) previewVideoRef.current.src = URL.createObjectURL(file);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -172,21 +145,13 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   useEffect(() => {
     const dz = dropZoneRef.current;
     if (!dz) return;
-
-    const onDragOver = (e: DragEvent) => {
-      e.preventDefault();
-      dz.classList.add('dragover');
-    };
-    const onDragLeave = () => {
-      dz.classList.remove('dragover');
-    };
+    const onDragOver = (e: DragEvent) => { e.preventDefault(); dz.classList.add('dragover'); };
+    const onDragLeave = () => dz.classList.remove('dragover');
     const onDrop = (e: DragEvent) => {
-      e.preventDefault();
-      dz.classList.remove('dragover');
+      e.preventDefault(); dz.classList.remove('dragover');
       const file = e.dataTransfer?.files?.[0];
       if (file) onFileChosen(file);
     };
-
     dz.addEventListener('dragover', onDragOver);
     dz.addEventListener('dragleave', onDragLeave);
     dz.addEventListener('drop', onDrop);
@@ -209,6 +174,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     stopCamera();
   };
 
+  // ── FIXED: startCamera no longer uses Socket.IO ──────────────
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -217,75 +183,35 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       });
       setMediaStream(stream);
       setIsCameraActive(true);
+      setRealTimeResults([]);
+      setStreamError('');
+
       if (cameraVideoRef.current) {
         cameraVideoRef.current.srcObject = stream;
-
-        const videoEl = cameraVideoRef.current;
-        videoEl.onloadedmetadata = async () => {
-          try {
-            await videoEl.play();
-          } catch (e) {
-            console.warn('Camera preview play() failed:', e);
-          }
+        cameraVideoRef.current.onloadedmetadata = async () => {
+          try { await cameraVideoRef.current!.play(); } catch (e) { console.warn(e); }
         };
       }
-
-      // Initialize Socket.IO connection for real-time streaming
-      const newSocket = io(apiUrl || 'http://localhost:5000', {
-        transports: ['polling'],
-        upgrade: false,
-      });
-      newSocket.on('connect', () => {
-        console.log('Connected to backend for streaming');
-      });
-
-      newSocket.on('analysis_result', (data) => {
-        setRealTimeAnalysis((prev: any[]) => [...prev.slice(-4), data]); // Keep last 5 results
-      });
-
-      newSocket.on('stream_error', (data) => {
-        console.error('Streaming error:', data.error);
-      });
-
-      setSocket(newSocket);
-      socketRef.current = newSocket;
     } catch (err: any) {
       alert(`⚠️ Error accessing camera: ${err.message || 'Camera access denied'}`);
-      console.error('Camera access error:', err);
     }
   };
 
   const stopCamera = () => {
     if (mediaStream) {
-      mediaStream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
+      mediaStream.getTracks().forEach((t: MediaStreamTrack) => t.stop());
       setMediaStream(null);
       setIsCameraActive(false);
-      if (cameraVideoRef.current) {
-        cameraVideoRef.current.srcObject = null;
-      }
+      if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null;
     }
-
     if (streamingIntervalRef.current) {
       clearInterval(streamingIntervalRef.current);
       streamingIntervalRef.current = null;
     }
-    frameCounterRef.current = 0;
-
-    // Disconnect socket
-    if (socket) {
-      socket.disconnect();
-      setSocket(null);
-    }
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-      socketRef.current = null;
-    }
-
+    frameInFlightRef.current = false;
     setIsRecording(false);
     setIsStreaming(false);
     setRecordingTime(0);
-    setRealTimeAnalysis([]);
-    setLivePredictions([]);
     if (recordingIntervalRef.current) {
       clearInterval(recordingIntervalRef.current);
       recordingIntervalRef.current = null;
@@ -293,47 +219,53 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   };
 
   const speakPrediction = (answer: string) => {
-    if ('speechSynthesis' in window) {
-      const text = `There is a ${answer} ahead. Watch out.`;
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'en-US';
-      utterance.rate = 0.9;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      speechSynthesis.speak(utterance);
-    }
+    if (!('speechSynthesis' in window)) return;
+    // Cancel any ongoing speech so we don't queue up
+    speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(`There is a ${answer} ahead. Watch out.`);
+    utterance.lang = 'en-US';
+    utterance.rate = 0.9;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    speechSynthesis.speak(utterance);
   };
 
+  // ── FIXED: pure HTTP polling, no Socket.IO ───────────────────
   const startFrameStreaming = () => {
     if (!cameraVideoRef.current || !apiUrl) return;
-
     if (streamingIntervalRef.current) {
       clearInterval(streamingIntervalRef.current);
       streamingIntervalRef.current = null;
     }
-
-    frameCounterRef.current = 0;
+    frameInFlightRef.current = false;
 
     streamingIntervalRef.current = window.setInterval(async () => {
+      // Skip if a request is already in-flight — prevents piling up requests
+      if (frameInFlightRef.current) return;
+
       const videoEl = cameraVideoRef.current;
-      if (!videoEl) return;
-      if (videoEl.readyState < 2) return;
-      if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) return;
+      if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) return;
 
       const canvas = captureCanvasRef.current ?? document.createElement('canvas');
       captureCanvasRef.current = canvas;
-
       canvas.width = videoEl.videoWidth;
       canvas.height = videoEl.videoHeight;
-
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      // Un-mirror the frame before sending (the video is CSS-mirrored)
+      ctx.save();
+      ctx.scale(-1, 1);
+      ctx.drawImage(videoEl, -canvas.width, 0, canvas.width, canvas.height);
+      ctx.restore();
 
       const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.7);
-      
+
+      frameInFlightRef.current = true;
+      setStreamError('');
       try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
         const response = await fetch(`${apiUrl}/analyze/frame`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -342,221 +274,173 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
             timestamp: Date.now(),
             question: 'what is in the picture',
           }),
+          signal: controller.signal,
         });
-        const result = await response.json();
-        console.log('Frame analysis result:', result);
-        if (result.success && result.answer) {
-          let answer = result.answer;
-          if (answer === 'unanswerable' || answer === 'unsuitable') {
-            answer = 'object';
-          }
-          setLivePredictions((prev: string[]) => [...prev.slice(-4), answer]);
-          
-          // Speak the prediction
-          speakPrediction(answer);
-        } else {
-          console.error('Frame analysis error:', result);
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`);
         }
-      } catch (err) {
-        console.error('Frame analysis error:', err);
+
+        const result = await response.json();
+
+        if (result.success && result.answer) {
+          let answer = result.answer as string;
+          if (answer === 'unanswerable' || answer === 'unsuitable') answer = 'object';
+
+          const entry: RealTimeResult = {
+            timestamp: Date.now(),
+            answer,
+            question: result.question || 'what is in the picture',
+          };
+
+          // ── Unified state update ──
+          setRealTimeResults(prev => [...prev.slice(-19), entry]); // keep last 20
+          speakPrediction(answer);
+        } else if (result.error) {
+          console.error('Frame analysis error:', result.error);
+          setStreamError(result.error);
+        }
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          console.warn('Frame analysis timed out');
+          setStreamError('Request timed out. Backend may be busy.');
+        } else {
+          console.error('Frame analysis fetch error:', err);
+          setStreamError(err.message || 'Network error');
+        }
+      } finally {
+        frameInFlightRef.current = false;
       }
-    }, 2000);
+    }, 2500); // Poll every 2.5s — gives backend time to respond
   };
 
   const startRecording = () => {
-    if (!mediaStream) {
-      alert('⚠️ Please start camera first');
-      return;
-    }
-
+    if (!mediaStream) { alert('⚠️ Please start camera first'); return; }
     const videoEl = cameraVideoRef.current;
     if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-      alert('⚠️ Camera is still starting. Please wait a second and try again.');
-      return;
+      alert('⚠️ Camera is still starting. Please wait a second and try again.'); return;
     }
 
-    const chunks: Blob[] = [];
-    recordedChunksRef.current = chunks;
-    setRecordedChunks(chunks);
+    recordedChunksRef.current = [];
+    setRecordedChunks([]);
 
     try {
       let options: MediaRecorderOptions = {};
-      const mimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
-      for (const mimeType of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mimeType)) {
-          options = { mimeType };
-          break;
-        }
+      for (const mimeType of ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']) {
+        if (MediaRecorder.isTypeSupported(mimeType)) { options = { mimeType }; break; }
       }
 
       const mediaRecorder = new MediaRecorder(mediaStream, options);
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event: BlobEvent) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
+        if (event.data.size > 0) recordedChunksRef.current.push(event.data);
       };
 
       mediaRecorder.onstop = () => {
         const mimeType = mediaRecorder.mimeType || 'video/webm';
         const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
         const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-        if (blob.size === 0) {
-          alert('⚠️ Recording was empty. Please try again (record for at least 2 seconds).');
-          return;
-        }
+        if (blob.size === 0) { alert('⚠️ Recording was empty. Please try again (record for at least 2 seconds).'); return; }
         const fileName = `recording-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
-        const file = new File([blob], fileName, { type: mimeType });
-        onFileChosen(file);
+        onFileChosen(new File([blob], fileName, { type: mimeType }));
       };
 
-      // Use a timeslice so the first session produces early chunks.
       mediaRecorder.start(500);
-
       setIsRecording(true);
       setIsStreaming(true);
       setRecordingTime(0);
+      setRealTimeResults([]);
+      setStreamError('');
 
+      // ── Start HTTP frame streaming ──
       startFrameStreaming();
 
       recordingIntervalRef.current = window.setInterval(() => {
-        setRecordingTime((prev: number) => prev + 1);
+        setRecordingTime(prev => prev + 1);
       }, 1000);
     } catch (err: any) {
       alert(`⚠️ Error starting recording: ${err.message || 'Recording failed'}`);
-      console.error('Recording error:', err);
     }
   };
 
   const stopRecording = () => {
     const mr = mediaRecorderRef.current;
     if (!mr || !isRecording) return;
-
-    try {
-      mr.requestData();
-    } catch {}
-
-    window.setTimeout(() => {
-      try {
-        mr.stop();
-      } catch {}
-    }, 200);
+    try { mr.requestData(); } catch {}
+    window.setTimeout(() => { try { mr.stop(); } catch {} }, 200);
 
     setIsRecording(false);
     setIsStreaming(false);
 
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
-
-    if (streamingIntervalRef.current) {
-      clearInterval(streamingIntervalRef.current);
-      streamingIntervalRef.current = null;
-    }
+    if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null; }
+    if (streamingIntervalRef.current) { clearInterval(streamingIntervalRef.current); streamingIntervalRef.current = null; }
+    frameInFlightRef.current = false;
   };
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopCamera();
-    };
-  }, []);
+  useEffect(() => () => stopCamera(), []);
 
-  const showStatus = (message: string, type: StatusType) => {
-    setStatusMessage(message);
-    setStatusType(type);
-  };
-
-  const showProgress = (percent: number, label?: string) => {
-    setProgressVisible(true);
-    setProgressPercent(percent);
-    if (label) setProgressLabel(label);
-  };
-
-  const hideProgress = () => {
-    setProgressVisible(false);
-  };
+  const showStatus = (message: string, type: StatusType) => { setStatusMessage(message); setStatusType(type); };
+  const showProgress = (percent: number, label?: string) => { setProgressVisible(true); setProgressPercent(percent); if (label) setProgressLabel(label); };
+  const hideProgress = () => setProgressVisible(false);
 
   const analyzeVideo = async () => {
-    if (!selectedFile) {
-      alert('⚠️ Please select a video file first');
-      return;
-    }
+    if (!selectedFile) { alert('⚠️ Please select a video file first'); return; }
     const url = apiUrl.trim();
-    if (!url) {
-      alert('⚠️ Please enter your backend API URL (e.g., http://localhost:5000)');
-      return;
-    }
+    if (!url) { alert('⚠️ Please enter your backend API URL'); return; }
 
-    try {
-      setResultsVisible(false);
-      setResults(null);
-      showStatus('⏳ Uploading video... This may take a few minutes depending on file size.', 'loading');
-      showProgress(0, 'Uploading video...');
-      startTimeRef.current = Date.now();
+    setResultsVisible(false);
+    setResults(null);
+    showStatus('⏳ Uploading video... This may take a few minutes depending on file size.', 'loading');
+    showProgress(0, 'Uploading video...');
+    startTimeRef.current = Date.now();
 
-      const formData = new FormData();
-      formData.append('video', selectedFile);
-      if (duration) formData.append('duration', duration);
-      formData.append('target_analyses', targetAnalyses || '8');
+    const formData = new FormData();
+    formData.append('video', selectedFile);
+    if (duration) formData.append('duration', duration);
+    formData.append('target_analyses', targetAnalyses || '8');
 
-      const xhr = new XMLHttpRequest();
+    const xhr = new XMLHttpRequest();
 
-      xhr.upload.addEventListener('progress', (e) => {
-        if (e.lengthComputable) {
-          const percentComplete = (e.loaded / e.total) * 50;
-          showProgress(percentComplete, 'Uploading video...');
-        }
-      });
+    xhr.upload.addEventListener('progress', (e) => {
+      if (e.lengthComputable) showProgress((e.loaded / e.total) * 50, 'Uploading video...');
+    });
 
-      xhr.addEventListener('load', () => {
-        if (xhr.status === 200) {
-          showProgress(100, 'Complete!');
-          const data: ApiResults = JSON.parse(xhr.responseText);
-          showStatus('✅ Video analysis complete!', 'success');
-          setTimeout(() => hideProgress(), 1000);
-          setResults(data);
-          setResultsVisible(true);
-        } else {
-          let errorMsg = 'Unknown error';
-          try {
-            errorMsg = (JSON.parse(xhr.responseText).error as string) || errorMsg;
-          } catch {}
-          showStatus(`❌ Error: ${errorMsg}`, 'error');
-          hideProgress();
-        }
-      });
+    xhr.upload.addEventListener('loadend', () => {
+      showProgress(50, 'Processing video frames...');
+      showStatus('⏳ Processing video frames with AI models... This may take several minutes.', 'loading');
+      let progress = 50;
+      const interval = setInterval(() => {
+        if (xhr.readyState === 4) { clearInterval(interval); }
+        else { progress += 2; if (progress < 95) showProgress(progress, 'Analyzing frames...'); }
+      }, 2000);
+    });
 
-      xhr.addEventListener('error', () => {
-        showStatus('❌ Network error occurred. Please check your connection and try again.', 'error');
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 200) {
+        showProgress(100, 'Complete!');
+        const data: ApiResults = JSON.parse(xhr.responseText);
+        showStatus('✅ Video analysis complete!', 'success');
+        setTimeout(() => hideProgress(), 1000);
+        setResults(data);
+        setResultsVisible(true);
+      } else {
+        let errorMsg = 'Unknown error';
+        try { errorMsg = (JSON.parse(xhr.responseText).error as string) || errorMsg; } catch {}
+        showStatus(`❌ Error: ${errorMsg}`, 'error');
         hideProgress();
-      });
+      }
+    });
 
-      xhr.upload.addEventListener('loadend', () => {
-        showProgress(50, 'Processing video frames...');
-        showStatus('⏳ Processing video frames with AI models... This may take several minutes.', 'loading');
-
-        let progress = 50;
-        const interval = setInterval(() => {
-          if (xhr.readyState === 4) {
-            clearInterval(interval);
-          } else {
-            progress += 2;
-            if (progress < 95) {
-              showProgress(progress, 'Analyzing frames...');
-            }
-          }
-        }, 2000);
-      });
-
-      xhr.open('POST', `${url}/analyze/video`);
-      xhr.send(formData);
-    } catch (err: any) {
-      showStatus(`❌ Error: ${err?.message ?? 'Unknown error'}`, 'error');
+    xhr.addEventListener('error', () => {
+      showStatus('❌ Network error. Check your connection and CORS settings.', 'error');
       hideProgress();
-    }
+    });
+
+    xhr.open('POST', `${url}/analyze/video`);
+    xhr.send(formData);
   };
 
   const processingTime = useMemo(() => {
@@ -569,10 +453,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-2xl overflow-hidden">
         <div className="bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-6 md:p-8">
           <div className="flex items-center justify-between gap-3">
-            <button
-              onClick={onBack}
-              className="rounded-full px-4 py-2 bg-black/15 hover:bg-white/25 transition !text-black"
-            >
+            <button onClick={onBack} className="rounded-full px-4 py-2 bg-black/15 hover:bg-white/25 transition !text-black">
               ← Back
             </button>
             <div className="text-center flex-1">
@@ -584,6 +465,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
         </div>
 
         <div className="p-6 md:p-10">
+          {/* API Config */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-4">⚙️ API Configuration</h2>
             <div className="grid md:grid-cols-2 gap-4">
@@ -593,32 +475,29 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                   type="text"
                   value={apiUrl}
                   onChange={(e) => setApiUrl(e.target.value)}
-                  placeholder="http://localhost:5000"
+                  placeholder="https://xxxx.ngrok-free.app"
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                 />
                 <small className="block mt-1 text-gray-500">
-                  Defaults to your local Flask server. If you expose it (e.g. ngrok), paste that URL here.
+                  Since you're on Vercel, use your ngrok HTTPS URL — localhost won't work from a deployed frontend.
                 </small>
               </div>
               <div className="bg-cyan-50 border-l-4 border-cyan-500 p-4 rounded">
                 <strong className="block text-cyan-900 mb-1">💡 Examples:</strong>
-                <div className="text-cyan-900">
-                  Local: http://localhost:5000
-                  <br />
-                  Ngrok: https://xxxx-xx-xxx-xxx-xxx.ngrok-free.app
+                <div className="text-cyan-900 text-sm">
+                  ✅ ngrok: https://xxxx-xx-xxx-xxx-xxx.ngrok-free.app<br />
+                  ❌ Local (won't work from Vercel): http://localhost:5000
                 </div>
               </div>
             </div>
           </div>
 
+          {/* Camera Section */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-6">📹 Upload or Record Video</h2>
 
-            {/* Camera Recording Section */}
             <div className="mb-6 p-6 rounded-xl bg-gradient-to-br from-purple-50 to-pink-50 border-2 border-purple-300">
-              <h3 className="text-xl font-semibold text-purple-700 mb-4 flex items-center gap-2">
-                📷 Record from Camera
-              </h3>
+              <h3 className="text-xl font-semibold text-purple-700 mb-4">📷 Record from Camera</h3>
 
               {!isCameraActive && !isRecording && (
                 <button
@@ -638,9 +517,8 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                       playsInline
                       muted
                       className="w-full max-h-[400px] block object-cover"
-                      style={{ transform: 'scaleX(-1)' }} // Mirror effect for natural camera view
+                      style={{ transform: 'scaleX(-1)' }}
                     />
-
                     {isRecording && (
                       <div className="absolute top-4 left-4 bg-red-600 text-white px-4 py-2 rounded-full flex items-center gap-2 font-semibold z-10">
                         <span className="w-3 h-3 bg-white rounded-full animate-pulse" />
@@ -649,62 +527,43 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     )}
                     {isStreaming && (
                       <div className="absolute top-4 right-4 bg-green-600 text-white px-3 py-1 rounded-full text-sm font-semibold z-10">
-                        📡 Live Streaming
+                        📡 Live Analysis
                       </div>
                     )}
                   </div>
 
-                  {/* New Live Predictions Box */}
+                  {/* ── FIXED: unified live results panel ── */}
                   <div className="p-4 rounded-xl bg-yellow-50 border-2 border-yellow-300 text-yellow-900">
-                    <div className="font-semibold mb-2">Live Predictions</div>
-                    <div className="space-y-1 max-h-[140px] overflow-y-auto">
-                      {livePredictions.length === 0 ? (
-                        <div className="text-yellow-700 text-sm">Start recording to see predictions...</div>
+                    <div className="font-semibold mb-2 flex items-center justify-between">
+                      <span>Live Predictions</span>
+                      {isStreaming && (
+                        <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded-full">
+                          {frameInFlightRef.current ? '⏳ Analysing…' : '✅ Ready'}
+                        </span>
+                      )}
+                    </div>
+                    <div className="space-y-1 max-h-[160px] overflow-y-auto">
+                      {realTimeResults.length === 0 ? (
+                        <div className="text-yellow-700 text-sm">
+                          {isStreaming ? '⏳ Waiting for first frame result...' : 'Start recording to see predictions...'}
+                        </div>
                       ) : (
-                        livePredictions.slice(-8).reverse().map((answer, idx) => (
-                          <div key={idx} className="font-semibold">
-                            There is a {answer} ahead. Watch out.
+                        [...realTimeResults].reverse().map((r, idx) => (
+                          <div key={idx} className="flex items-start gap-2">
+                            <span className="text-xs text-yellow-600 shrink-0 mt-0.5">
+                              {new Date(r.timestamp).toLocaleTimeString()}
+                            </span>
+                            <span className="font-semibold">There is a {r.answer} ahead. Watch out.</span>
                           </div>
                         ))
                       )}
                     </div>
                   </div>
 
-                  {(() => {
-                    const latest = realTimeAnalysis[realTimeAnalysis.length - 1];
-                    if (!latest) return null;
-                    if (latest.error) {
-                      return (
-                        <div className="p-4 rounded-xl bg-red-50 border-2 border-red-300 text-red-800 font-semibold">
-                          {latest.error}
-                        </div>
-                      );
-                    }
-                    return null;
-                  })()}
-
-                  {/* Real-time Analysis Results */}
-                  {realTimeAnalysis.length > 0 && (
-                    <div className="p-4 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-300">
-                      <h4 className="text-lg font-semibold text-blue-700 mb-3">🔍 Real-time Analysis</h4>
-                      <div className="space-y-2 max-h-[200px] overflow-y-auto">
-                        {realTimeAnalysis.map((analysis, index) => (
-                          <div key={index} className="p-3 bg-white rounded-lg border border-blue-200">
-                            <div className="text-sm text-gray-600 mb-1">
-                              {new Date(analysis.timestamp).toLocaleTimeString()}
-                            </div>
-                            {analysis.question && (
-                              <div className="text-xs text-blue-700 font-semibold mb-1">Q: {analysis.question}</div>
-                            )}
-                            {analysis.answer && (
-                              <div className="text-sm text-gray-900 font-semibold">A: {analysis.answer}</div>
-                            )}
-                            {analysis.error && (
-                              <div className="text-xs text-red-700 mt-2">{analysis.error}</div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
+                  {/* Stream error banner */}
+                  {streamError && (
+                    <div className="p-3 rounded-lg bg-red-50 border border-red-300 text-red-800 text-sm">
+                      ⚠️ {streamError}
                     </div>
                   )}
 
@@ -737,7 +596,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               )}
             </div>
 
-            {/* File Upload Section */}
+            {/* File Upload */}
             <div className="mb-4">
               <h3 className="text-xl font-semibold text-indigo-600 mb-4">📁 Or Upload Video File</h3>
               <div
@@ -758,18 +617,12 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                 <div className="grid grid-cols-[auto_1fr] gap-2 items-center">
                   <span className="font-semibold text-green-800">📄 File Name:</span>
                   <span className="text-green-800">{selectedFile.name}</span>
-
                   <span className="font-semibold text-green-800">💾 File Size:</span>
                   <span className="text-green-800">
-                    {selectedFile.size < 1024
-                      ? `${selectedFile.size} B`
-                      : selectedFile.size < 1024 * 1024
+                    {selectedFile.size < 1024 * 1024
                       ? `${(selectedFile.size / 1024).toFixed(2)} KB`
-                      : selectedFile.size < 1024 * 1024 * 1024
-                      ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`
-                      : `${(selectedFile.size / (1024 * 1024 * 1024)).toFixed(2)} GB`}
+                      : `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`}
                   </span>
-
                   <span className="font-semibold text-green-800">🎞️ Format:</span>
                   <span className="text-green-800">{selectedFile.type.split('/')[1]?.toUpperCase() || '-'}</span>
                 </div>
@@ -786,10 +639,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               <div>
                 <label className="block mb-2 font-semibold text-gray-700">Duration to Process (seconds)</label>
                 <input
-                  type="number"
-                  min={5}
-                  max={300}
-                  value={duration}
+                  type="number" min={5} max={300} value={duration}
                   onChange={(e) => setDuration(e.target.value)}
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                   placeholder="Leave empty for full video"
@@ -799,10 +649,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               <div>
                 <label className="block mb-2 font-semibold text-gray-700">Number of Frame Analyses</label>
                 <input
-                  type="number"
-                  min={3}
-                  max={50}
-                  value={targetAnalyses}
+                  type="number" min={3} max={50} value={targetAnalyses}
                   onChange={(e) => setTargetAnalyses(e.target.value)}
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                 />
@@ -821,15 +668,10 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     <span className="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
                     Processing...
                   </span>
-                ) : (
-                  'Analyze Video'
-                )}
+                ) : 'Analyze Video'}
               </button>
               {selectedFile && (
-                <button
-                  onClick={clearVideo}
-                  className="rounded-full px-6 py-3 text-white bg-gradient-to-r from-gray-500 to-gray-700 shadow hover:shadow-lg"
-                >
+                <button onClick={clearVideo} className="rounded-full px-6 py-3 text-white bg-gradient-to-r from-gray-500 to-gray-700 shadow hover:shadow-lg">
                   Clear Selection
                 </button>
               )}
@@ -850,24 +692,21 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
             )}
 
             {statusType && (
-              <div
-                className={[
-                  'mt-4 rounded-xl p-4 font-semibold',
-                  statusType === 'loading' && 'bg-yellow-100 text-yellow-800 border-2 border-yellow-300',
-                  statusType === 'success' && 'bg-green-100 text-green-800 border-2 border-green-300',
-                  statusType === 'error' && 'bg-red-100 text-red-800 border-2 border-red-300',
-                ]
-                  .filter(Boolean)
-                  .join(' ')}
-              >
+              <div className={[
+                'mt-4 rounded-xl p-4 font-semibold',
+                statusType === 'loading' && 'bg-yellow-100 text-yellow-800 border-2 border-yellow-300',
+                statusType === 'success' && 'bg-green-100 text-green-800 border-2 border-green-300',
+                statusType === 'error' && 'bg-red-100 text-red-800 border-2 border-red-300',
+              ].filter(Boolean).join(' ')}>
                 {statusMessage}
               </div>
             )}
           </div>
 
+          {/* Results */}
           {resultsVisible && results && (
             <div className="rounded-xl border-2 border-indigo-500 p-6 bg-white shadow">
-              <h3 className="text-2xl font-semibold text-indigo-600 mb-4 flex items-center gap-2">📊 Analysis Results</h3>
+              <h3 className="text-2xl font-semibold text-indigo-600 mb-4">📊 Analysis Results</h3>
 
               {videoInfo && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
@@ -887,33 +726,17 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               )}
 
               <div className="flex gap-2 border-b border-gray-200 mb-4">
-                <button
-                  onClick={() => setActiveTab('summary')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'summary' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  📋 Summary
-                </button>
-                <button
-                  onClick={() => setActiveTab('frames')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'frames' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  🎞️ Frame Analysis
-                </button>
-                <button
-                  onClick={() => setActiveTab('raw')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'raw' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  📄 Raw Data
-                </button>
+                {(['summary', 'frames', 'raw'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => setActiveTab(tab)}
+                    className={['px-4 py-2 font-semibold border-b-2',
+                      activeTab === tab ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent'
+                    ].join(' ')}
+                  >
+                    {tab === 'summary' ? '📋 Summary' : tab === 'frames' ? '🎞️ Frame Analysis' : '📄 Raw Data'}
+                  </button>
+                ))}
               </div>
 
               {activeTab === 'summary' && (
