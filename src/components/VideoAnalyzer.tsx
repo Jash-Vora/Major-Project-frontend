@@ -294,7 +294,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const speakPrediction = (answer: string) => {
     if ('speechSynthesis' in window) {
-      const text = `${answer} ahead.`;
+      const text = `${answer} `;
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.lang = 'en-US';
       utterance.rate = 0.9;
@@ -668,11 +668,18 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                       {livePredictions.length === 0 ? (
                         <div className="text-yellow-700 text-sm">Start recording to see predictions...</div>
                       ) : (
-                        livePredictions.slice(-8).reverse().map((answer, idx) => (
-                          <div key={idx} className="font-semibold">
-                            There is a {answer} ahead. Watch out.
-                          </div>
-                        ))
+                        livePredictions.slice(-8).reverse().map((item, idx) => {
+                          // Parse the combined text to extract answer and navigation
+                          const parts = item.split(' and ');
+                          const answer = parts[0];
+                          const navigation = parts.slice(1);
+
+                          return (
+                            <div key={idx} className="font-semibold">
+                              {answer} ahead{navigation.length > 0 && ` and (${navigation.join(' and ')})`}
+                            </div>
+                          );
+                        })
                       )}
                     </div>
                   </div>
