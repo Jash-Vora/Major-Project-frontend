@@ -37,6 +37,11 @@ interface VideoAnalyzerProps {
   onBack?: () => void;
 }
 
+// Headers sent with every fetch to the ngrok-tunnelled backend
+const NGROK_HEADERS = {
+  'ngrok-skip-browser-warning': 'true',
+};
+
 export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   const [apiUrl, setApiUrl] = useState<string>('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -60,10 +65,9 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   const [recordingTime, setRecordingTime] = useState<number>(0);
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
 
-  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const recordedChunksRef = useRef<Blob[]>([]);
 
-  // ── FIXED: single unified real-time results list ──
+  // Unified real-time results (single source of truth — no Socket.IO)
   const [realTimeResults, setRealTimeResults] = useState<RealTimeResult[]>([]);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [streamError, setStreamError] = useState<string>('');
@@ -78,9 +82,10 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   const streamingIntervalRef = useRef<number | null>(null);
   const startTimeRef = useRef<number | null>(null);
 
-  // Track whether a frame analysis is already in-flight to avoid overlapping requests
+  // Prevent overlapping in-flight frame requests
   const frameInFlightRef = useRef<boolean>(false);
 
+  // ── Persist API URL ───────────────────────────────────────
   useEffect(() => {
     const saved = localStorage.getItem('apiUrl');
     setApiUrl(saved || 'http://localhost:5000');
@@ -90,13 +95,11 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     if (apiUrl) localStorage.setItem('apiUrl', apiUrl);
   }, [apiUrl]);
 
-  // Keep camera preview in sync with stream
+  // ── Camera preview sync ───────────────────────────────────
   useEffect(() => {
     const videoEl = cameraVideoRef.current;
     if (!videoEl || !mediaStream) return;
-    if (videoEl.srcObject !== mediaStream) {
-      videoEl.srcObject = mediaStream;
-    }
+    if (videoEl.srcObject !== mediaStream) videoEl.srcObject = mediaStream;
     const tryPlay = async () => {
       try { await videoEl.play(); } catch (e) { console.warn('Camera play() failed:', e); }
     };
@@ -105,6 +108,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     return () => { if (videoEl.onloadedmetadata) videoEl.onloadedmetadata = null; };
   }, [mediaStream, isCameraActive, isRecording]);
 
+  // ── Summary text memo ─────────────────────────────────────
   const summaryText = useMemo(() => {
     if (!results?.results?.frame_analyses) return '';
     const frames = results.results.frame_analyses;
@@ -125,6 +129,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const videoInfo = results?.results?.video_processing_info;
 
+  // ── File helpers ──────────────────────────────────────────
   const onDropZoneClick = () => fileInputRef.current?.click();
 
   const onFileChosen = (file: File) => {
@@ -174,7 +179,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     stopCamera();
   };
 
-  // ── FIXED: startCamera no longer uses Socket.IO ──────────────
+  // ── Camera ────────────────────────────────────────────────
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -185,7 +190,6 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       setIsCameraActive(true);
       setRealTimeResults([]);
       setStreamError('');
-
       if (cameraVideoRef.current) {
         cameraVideoRef.current.srcObject = stream;
         cameraVideoRef.current.onloadedmetadata = async () => {
@@ -220,8 +224,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const speakPrediction = (answer: string) => {
     if (!('speechSynthesis' in window)) return;
-    // Cancel any ongoing speech so we don't queue up
-    speechSynthesis.cancel();
+    speechSynthesis.cancel(); // don't queue up
     const utterance = new SpeechSynthesisUtterance(`There is a ${answer} ahead. Watch out.`);
     utterance.lang = 'en-US';
     utterance.rate = 0.9;
@@ -230,7 +233,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     speechSynthesis.speak(utterance);
   };
 
-  // ── FIXED: pure HTTP polling, no Socket.IO ───────────────────
+  // ── Pure HTTP frame streaming (no Socket.IO) ──────────────
   const startFrameStreaming = () => {
     if (!cameraVideoRef.current || !apiUrl) return;
     if (streamingIntervalRef.current) {
@@ -240,20 +243,18 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     frameInFlightRef.current = false;
 
     streamingIntervalRef.current = window.setInterval(async () => {
-      // Skip if a request is already in-flight — prevents piling up requests
-      if (frameInFlightRef.current) return;
+      if (frameInFlightRef.current) return; // skip if previous request still running
 
       const videoEl = cameraVideoRef.current;
-      if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) return;
+      if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) return;
 
+      // Set up canvas (un-mirror the CSS-mirrored preview)
       const canvas = captureCanvasRef.current ?? document.createElement('canvas');
       captureCanvasRef.current = canvas;
       canvas.width = videoEl.videoWidth;
       canvas.height = videoEl.videoHeight;
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-
-      // Un-mirror the frame before sending (the video is CSS-mirrored)
       ctx.save();
       ctx.scale(-1, 1);
       ctx.drawImage(videoEl, -canvas.width, 0, canvas.width, canvas.height);
@@ -263,12 +264,17 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
       frameInFlightRef.current = true;
       setStreamError('');
+
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+        const timeout = setTimeout(() => controller.abort(), 15000);
+
         const response = await fetch(`${apiUrl}/analyze/frame`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...NGROK_HEADERS,          // ← skip ngrok browser-warning page
+          },
           body: JSON.stringify({
             data: jpegDataUrl,
             timestamp: Date.now(),
@@ -294,68 +300,66 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
             answer,
             question: result.question || 'what is in the picture',
           };
-
-          // ── Unified state update ──
-          setRealTimeResults(prev => [...prev.slice(-19), entry]); // keep last 20
+          setRealTimeResults(prev => [...prev.slice(-19), entry]);
           speakPrediction(answer);
         } else if (result.error) {
-          console.error('Frame analysis error:', result.error);
           setStreamError(result.error);
         }
       } catch (err: any) {
         if (err.name === 'AbortError') {
-          console.warn('Frame analysis timed out');
           setStreamError('Request timed out. Backend may be busy.');
         } else {
-          console.error('Frame analysis fetch error:', err);
-          setStreamError(err.message || 'Network error');
+          setStreamError(err.message || 'Network error — check your ngrok URL and CORS settings.');
         }
       } finally {
         frameInFlightRef.current = false;
       }
-    }, 2500); // Poll every 2.5s — gives backend time to respond
+    }, 2500); // 2.5s between frames
   };
 
+  // ── Recording ─────────────────────────────────────────────
   const startRecording = () => {
     if (!mediaStream) { alert('⚠️ Please start camera first'); return; }
     const videoEl = cameraVideoRef.current;
-    if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-      alert('⚠️ Camera is still starting. Please wait a second and try again.'); return;
+    if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) {
+      alert('⚠️ Camera is still starting. Please wait a second and try again.');
+      return;
     }
 
     recordedChunksRef.current = [];
-    setRecordedChunks([]);
+
+    let options: MediaRecorderOptions = {};
+    for (const mt of ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']) {
+      if (MediaRecorder.isTypeSupported(mt)) { options = { mimeType: mt }; break; }
+    }
 
     try {
-      let options: MediaRecorderOptions = {};
-      for (const mimeType of ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']) {
-        if (MediaRecorder.isTypeSupported(mimeType)) { options = { mimeType }; break; }
-      }
+      const mr = new MediaRecorder(mediaStream, options);
+      mediaRecorderRef.current = mr;
 
-      const mediaRecorder = new MediaRecorder(mediaStream, options);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event: BlobEvent) => {
-        if (event.data.size > 0) recordedChunksRef.current.push(event.data);
+      mr.ondataavailable = (e: BlobEvent) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
       };
 
-      mediaRecorder.onstop = () => {
-        const mimeType = mediaRecorder.mimeType || 'video/webm';
-        const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
+      mr.onstop = () => {
+        const mimeType = mr.mimeType || 'video/webm';
+        const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
         const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-        if (blob.size === 0) { alert('⚠️ Recording was empty. Please try again (record for at least 2 seconds).'); return; }
-        const fileName = `recording-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
+        if (blob.size === 0) {
+          alert('⚠️ Recording was empty. Please try again (record for at least 2 seconds).');
+          return;
+        }
+        const fileName = `recording-${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
         onFileChosen(new File([blob], fileName, { type: mimeType }));
       };
 
-      mediaRecorder.start(500);
+      mr.start(500);
       setIsRecording(true);
       setIsStreaming(true);
       setRecordingTime(0);
       setRealTimeResults([]);
       setStreamError('');
 
-      // ── Start HTTP frame streaming ──
       startFrameStreaming();
 
       recordingIntervalRef.current = window.setInterval(() => {
@@ -374,7 +378,6 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
     setIsRecording(false);
     setIsStreaming(false);
-
     if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null; }
     if (streamingIntervalRef.current) { clearInterval(streamingIntervalRef.current); streamingIntervalRef.current = null; }
     frameInFlightRef.current = false;
@@ -382,10 +385,12 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   useEffect(() => () => stopCamera(), []);
 
+  // ── Status / progress helpers ─────────────────────────────
   const showStatus = (message: string, type: StatusType) => { setStatusMessage(message); setStatusType(type); };
-  const showProgress = (percent: number, label?: string) => { setProgressVisible(true); setProgressPercent(percent); if (label) setProgressLabel(label); };
+  const showProgress = (pct: number, label?: string) => { setProgressVisible(true); setProgressPercent(pct); if (label) setProgressLabel(label); };
   const hideProgress = () => setProgressVisible(false);
 
+  // ── Video upload + analysis ───────────────────────────────
   const analyzeVideo = async () => {
     if (!selectedFile) { alert('⚠️ Please select a video file first'); return; }
     const url = apiUrl.trim();
@@ -393,7 +398,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
     setResultsVisible(false);
     setResults(null);
-    showStatus('⏳ Uploading video... This may take a few minutes depending on file size.', 'loading');
+    showStatus('⏳ Uploading video... This may take a few minutes.', 'loading');
     showProgress(0, 'Uploading video...');
     startTimeRef.current = Date.now();
 
@@ -410,10 +415,10 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
     xhr.upload.addEventListener('loadend', () => {
       showProgress(50, 'Processing video frames...');
-      showStatus('⏳ Processing video frames with AI models... This may take several minutes.', 'loading');
+      showStatus('⏳ Processing video frames with AI models...', 'loading');
       let progress = 50;
-      const interval = setInterval(() => {
-        if (xhr.readyState === 4) { clearInterval(interval); }
+      const iv = setInterval(() => {
+        if (xhr.readyState === 4) { clearInterval(iv); }
         else { progress += 2; if (progress < 95) showProgress(progress, 'Analyzing frames...'); }
       }, 2000);
     });
@@ -435,11 +440,13 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     });
 
     xhr.addEventListener('error', () => {
-      showStatus('❌ Network error. Check your connection and CORS settings.', 'error');
+      showStatus('❌ Network error. Check your connection and ngrok URL.', 'error');
       hideProgress();
     });
 
     xhr.open('POST', `${url}/analyze/video`);
+    // Set ngrok header on XHR too
+    xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
     xhr.send(formData);
   };
 
@@ -448,9 +455,12 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     return `${((Date.now() - startTimeRef.current) / 1000).toFixed(1)}s`;
   }, [resultsVisible]);
 
+  // ── Render ────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-400 to-purple-600 p-5">
       <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-2xl overflow-hidden">
+
+        {/* Header */}
         <div className="bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-6 md:p-8">
           <div className="flex items-center justify-between gap-3">
             <button onClick={onBack} className="rounded-full px-4 py-2 bg-black/15 hover:bg-white/25 transition !text-black">
@@ -465,6 +475,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
         </div>
 
         <div className="p-6 md:p-10">
+
           {/* API Config */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-4">⚙️ API Configuration</h2>
@@ -479,7 +490,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                 />
                 <small className="block mt-1 text-gray-500">
-                  Since you're on Vercel, use your ngrok HTTPS URL — localhost won't work from a deployed frontend.
+                  Since you're on Vercel, use your <strong>ngrok HTTPS URL</strong> — localhost won't work.
                 </small>
               </div>
               <div className="bg-cyan-50 border-l-4 border-cyan-500 p-4 rounded">
@@ -492,10 +503,11 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
             </div>
           </div>
 
-          {/* Camera Section */}
+          {/* Upload / Record Section */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-6">📹 Upload or Record Video</h2>
 
+            {/* Camera */}
             <div className="mb-6 p-6 rounded-xl bg-gradient-to-br from-purple-50 to-pink-50 border-2 border-purple-300">
               <h3 className="text-xl font-semibold text-purple-700 mb-4">📷 Record from Camera</h3>
 
@@ -510,6 +522,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
               {isCameraActive && (
                 <div className="space-y-4">
+                  {/* Camera preview */}
                   <div className="rounded-xl overflow-hidden shadow-lg bg-black relative">
                     <video
                       ref={cameraVideoRef}
@@ -532,7 +545,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     )}
                   </div>
 
-                  {/* ── FIXED: unified live results panel ── */}
+                  {/* Live predictions panel */}
                   <div className="p-4 rounded-xl bg-yellow-50 border-2 border-yellow-300 text-yellow-900">
                     <div className="font-semibold mb-2 flex items-center justify-between">
                       <span>Live Predictions</span>
@@ -560,13 +573,14 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     </div>
                   </div>
 
-                  {/* Stream error banner */}
+                  {/* Error banner */}
                   {streamError && (
                     <div className="p-3 rounded-lg bg-red-50 border border-red-300 text-red-800 text-sm">
                       ⚠️ {streamError}
                     </div>
                   )}
 
+                  {/* Controls */}
                   <div className="flex flex-wrap gap-3">
                     {!isRecording ? (
                       <>
@@ -696,7 +710,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                 'mt-4 rounded-xl p-4 font-semibold',
                 statusType === 'loading' && 'bg-yellow-100 text-yellow-800 border-2 border-yellow-300',
                 statusType === 'success' && 'bg-green-100 text-green-800 border-2 border-green-300',
-                statusType === 'error' && 'bg-red-100 text-red-800 border-2 border-red-300',
+                statusType === 'error'   && 'bg-red-100 text-red-800 border-2 border-red-300',
               ].filter(Boolean).join(' ')}>
                 {statusMessage}
               </div>
@@ -710,18 +724,16 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
               {videoInfo && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Total Frames Analyzed</div>
-                    <div className="text-2xl font-bold text-indigo-600">{videoInfo.analyzed_frames ?? '-'}</div>
-                  </div>
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Video Duration</div>
-                    <div className="text-2xl font-bold text-indigo-600">{videoInfo.total_duration ?? '-'}</div>
-                  </div>
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Processing Time</div>
-                    <div className="text-2xl font-bold text-indigo-600">{processingTime}</div>
-                  </div>
+                  {[
+                    { label: 'Total Frames Analyzed', value: videoInfo.analyzed_frames ?? '-' },
+                    { label: 'Video Duration',         value: videoInfo.total_duration ?? '-' },
+                    { label: 'Processing Time',        value: processingTime },
+                  ].map(({ label, value }) => (
+                    <div key={label} className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
+                      <div className="text-gray-600 text-sm">{label}</div>
+                      <div className="text-2xl font-bold text-indigo-600">{value}</div>
+                    </div>
+                  ))}
                 </div>
               )}
 
