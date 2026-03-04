@@ -336,37 +336,35 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.7);
       
       try {
-        const response = await fetch(`${apiUrl}/analyze/frame`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            data: jpegDataUrl,
-            timestamp: Date.now(),
-            question: 'what is in the picture',
-          }),
-        });
-        const result = await response.json();
-        console.log('Frame analysis result:', result);
+        const response = await fetch(`${apiUrl}/analyze/image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_data: jpegDataUrl,
+          mode: 'comprehensive',
+          detail_level: 'detailed',
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.success && result.results) {
+        const data = result.results;
         
-        if (result.success && result.answer) {
-          let answer = result.answer;
-          if (answer === 'unanswerable' || answer === 'unsuitable') {
-            answer = 'object';
-          }
+        // Get Florence navigation description
+        const navDesc = data.navigation_description ?? data.description ?? '';
+        
+        // Get YOLO object navigation descriptions with distances
+        const objectNavs = (data.objects ?? [])
+          .slice(0, 5)
+          .map((obj: any) => obj.navigation_description)
+          .filter(Boolean);
 
-          let combinedText = answer;
-          let navList = result.navigation || [];
-            if (navList.length > 0) {
-              combinedText += ' and ' + navList.join(' and ');
-            }
+        const combinedText = [navDesc, ...objectNavs].filter(Boolean).join('. ');
 
-          console.log('🧭 Navigation Elements:', navList);
-          console.log('📝 Combined Text:', combinedText);
-          setLivePredictions((prev: string[]) => [...prev.slice(-4), combinedText]);
-          
-          // Speak the prediction
-          speakPrediction(combinedText);
-        } else {
+        setLivePredictions((prev: string[]) => [...prev.slice(-4), combinedText]);
+        speakPrediction(combinedText);
+      } else {
           console.error('Frame analysis error:', result);
         }
       } catch (err) {
