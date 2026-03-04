@@ -15,6 +15,7 @@ type ApiResults = {
     frame_analyses?: Array<{
       timestamp?: string;
       description?: string;
+      navigation_description?: string;
       objects?: Array<{
         object: string;
         confidence: number;
@@ -131,6 +132,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     frames.forEach((frame: FrameAnalysis, idx: number) => {
       summary += `Frame ${idx + 1} (${frame.timestamp ?? '-'}):\n`;
       summary += `  Description: ${frame.description ?? 'N/A'}\n`;
+      summary += `  Navigation: ${(frame as any).navigation_description ?? 'N/A'}\n`; // ← add this
       if (frame.objects && frame.objects.length > 0) {
         summary += `  Objects Detected: ${frame.objects.length}\n`;
         frame.objects.slice(0, 3).forEach((obj: DetectedObject) => {
