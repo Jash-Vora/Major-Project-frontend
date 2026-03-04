@@ -334,13 +334,14 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
       const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.7);
+      const base64Data = jpegDataUrl.split(',')[1];
       
       try {
         const response = await fetch(`${apiUrl}/analyze/image`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          image_data: jpegDataUrl,
+          image_data: base64Data,
           mode: 'comprehensive',
           detail_level: 'detailed',
         }),
