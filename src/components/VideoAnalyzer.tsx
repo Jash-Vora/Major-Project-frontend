@@ -348,26 +348,26 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       });
 
       const result = await response.json();
-
-      if (result.success && result.results) {
-        const data = result.results;
-        
-        // Get Florence navigation description
+      console.log('Frame analysis result:', result);
+      
+      // result from /analyze/image wraps data in result.results
+      const data = result.results ?? result; // ← handle both shapes
+      
+      if (data.description || data.navigation_description) {
         const navDesc = data.navigation_description ?? data.description ?? '';
-        
-        // Get YOLO object navigation descriptions with distances
+      
         const objectNavs = (data.objects ?? [])
           .slice(0, 5)
           .map((obj: any) => obj.navigation_description)
           .filter(Boolean);
-
+      
         const combinedText = [navDesc, ...objectNavs].filter(Boolean).join('. ');
-
+      
         setLivePredictions((prev: string[]) => [...prev.slice(-4), combinedText]);
         speakPrediction(combinedText);
       } else {
-          console.error('Frame analysis error:', result);
-        }
+        console.error('Frame analysis error:', result);
+      }
       } catch (err) {
         console.error('Frame analysis error:', err);
       }
