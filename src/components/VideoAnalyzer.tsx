@@ -29,6 +29,80 @@ type DetectedObject = NonNullable<FrameAnalysis['objects']>[number];
 
 type StatusType = 'loading' | 'success' | 'error' | null;
 
+// ── TTS helpers ──────────────────────────────────────────────
+// Priority-aware queue:
+//   - danger      → cancel everything, speak immediately
+//   - scene       → queue, medium urgency (NEW — doc-3 scene fix)
+//   - alert       → queue unless already queued
+//   - ambient     → drop if queue is backed up (>= 2 items)
+//
+// FIX (doc-3): queue cap lowered to 2 for ambient so stale messages
+// never pile up. Danger still clears everything on arrival.
+// FIX (doc-3 scene): "scene" tier treated like alert for queueing purposes.
+
+const ttsQueue: Array<{ text: string; interrupt: boolean; rate: number; volume: number }> = [];
+let ttsBusy = false;
+
+function ttsFlush() {
+  if (ttsBusy || ttsQueue.length === 0) return;
+  const { text, rate, volume } = ttsQueue.shift()!;
+  ttsBusy = true;
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US';
+  utt.rate = rate;
+  utt.volume = volume;
+  utt.onend = () => {
+    ttsBusy = false;
+    ttsFlush();
+  };
+  utt.onerror = () => {
+    ttsBusy = false;
+    ttsFlush();
+  };
+  speechSynthesis.speak(utt);
+}
+
+function speakEvent(tier: string, text: string, interrupt: boolean, urgency: number) {
+  if (!('speechSynthesis' in window)) return;
+
+  if (interrupt) {
+    // Danger — cancel everything and speak immediately
+    speechSynthesis.cancel();
+    ttsQueue.length = 0;
+    ttsBusy = false;
+  }
+
+  // FIX: Drop duplicate messages already queued (any tier)
+  if (ttsQueue.some((q) => q.text === text)) return;
+
+  // FIX: Cap queue at 2 for ambient — stale navigation hints are useless
+  if (ttsQueue.length >= 2 && tier === 'ambient') return;
+
+  // FIX: Also cap alerts at 3 total to prevent pile-up on busy scenes
+  if (ttsQueue.length >= 3 && tier === 'alert') return;
+
+  // FIX (doc-3 scene): scene tier — treat like alert, cap at 3 total.
+  // Scene changes are meaningful but should not pile up either.
+  if (ttsQueue.length >= 3 && tier === 'scene') return;
+
+  ttsQueue.push({
+    text,
+    interrupt,
+    rate: 0.85 + urgency * 0.25, // danger ~1.1x, ambient ~0.85x
+    volume: 0.7 + urgency * 0.3,  // danger 1.0, ambient 0.7
+  });
+  ttsFlush();
+}
+
+// ── Types ────────────────────────────────────────────────────
+
+interface SpeechEvent {
+  tier: string;
+  text: string;
+  urgency: number;
+  interrupt: boolean;
+}
+
 interface VideoAnalyzerProps {
   onBack?: () => void;
 }
@@ -58,12 +132,14 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const stopRequestedRef = useRef<boolean>(false);
-  const forceStopTimeoutRef = useRef<number | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
   const [realTimeAnalysis, setRealTimeAnalysis] = useState<any[]>([]);
   const [isStreaming, setIsStreaming] = useState<boolean>(false);
-  const [livePredictions, setLivePredictions] = useState<string[]>([]);
+
+  // Live predictions show individual speech events
+  const [livePredictions, setLivePredictions] = useState<
+    Array<{ tier: string; text: string; ts: number }>
+  >([]);
 
   const socketRef = useRef<Socket | null>(null);
 
@@ -78,51 +154,34 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   const frameCounterRef = useRef<number>(0);
   const startTimeRef = useRef<number | null>(null);
 
+  // FIX (doc-3): Track last speech time on the frontend too, so we never
+  // fire TTS more often than MIN_SILENCE_GAP even if the backend slips.
+  const lastSpeechTimeRef = useRef<number>(0);
+  const MIN_SPEECH_GAP_MS = 2000; // matches backend MIN_SILENCE_GAP
+
   useEffect(() => {
     const saved = localStorage.getItem('apiUrl');
-    if (saved) {
-      setApiUrl(saved);
-    } else {
-      setApiUrl('http://localhost:5000');
-    }
+    setApiUrl(saved ?? 'http://localhost:5000');
   }, []);
 
   useEffect(() => {
-    if (apiUrl) {
-      localStorage.setItem('apiUrl', apiUrl);
-    }
+    if (apiUrl) localStorage.setItem('apiUrl', apiUrl);
   }, [apiUrl]);
 
   useEffect(() => {
     const videoEl = cameraVideoRef.current;
-    if (!videoEl) return;
-    if (!mediaStream) return;
+    if (!videoEl || !mediaStream) return;
 
-    if (videoEl.srcObject !== mediaStream) {
-      videoEl.srcObject = mediaStream;
-    }
+    if (videoEl.srcObject !== mediaStream) videoEl.srcObject = mediaStream;
 
     const tryPlay = async () => {
-      try {
-        await videoEl.play();
-      } catch (e) {
-        console.warn('Camera preview play() failed:', e);
-      }
+      try { await videoEl.play(); } catch (e) { console.warn('Camera preview play() failed:', e); }
     };
 
-    if (videoEl.readyState >= 2) {
-      void tryPlay();
-    } else {
-      videoEl.onloadedmetadata = () => {
-        void tryPlay();
-      };
-    }
+    if (videoEl.readyState >= 2) void tryPlay();
+    else videoEl.onloadedmetadata = () => void tryPlay();
 
-    return () => {
-      if (videoEl.onloadedmetadata) {
-        videoEl.onloadedmetadata = null;
-      }
-    };
+    return () => { if (videoEl.onloadedmetadata) videoEl.onloadedmetadata = null; };
   }, [mediaStream, isCameraActive, isRecording]);
 
   const summaryText = useMemo(() => {
@@ -132,7 +191,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     frames.forEach((frame: FrameAnalysis, idx: number) => {
       summary += `Frame ${idx + 1} (${frame.timestamp ?? '-'}):\n`;
       summary += `  Description: ${frame.description ?? 'N/A'}\n`;
-      summary += `  Navigation: ${(frame as any).navigation_description ?? 'N/A'}\n`; // ← add this
+      summary += `  Navigation: ${(frame as any).navigation_description ?? 'N/A'}\n`;
       if (frame.objects && frame.objects.length > 0) {
         summary += `  Objects Detected: ${frame.objects.length}\n`;
         frame.objects.slice(0, 3).forEach((obj: DetectedObject) => {
@@ -146,24 +205,16 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
 
   const videoInfo = results?.results?.video_processing_info;
 
-  const onDropZoneClick = () => {
-    fileInputRef.current?.click();
-  };
+  const onDropZoneClick = () => fileInputRef.current?.click();
 
   const onFileChosen = (file: File) => {
-    if (!file.type.startsWith('video/')) {
-      alert('⚠️ Please select a valid video file');
-      return;
-    }
+    if (!file.type.startsWith('video/')) { alert('⚠️ Please select a valid video file'); return; }
     if (file.size > 500 * 1024 * 1024) {
-      const cont = confirm('⚠️ This file is large and may take long to upload/process. Continue?');
-      if (!cont) return;
+      if (!confirm('⚠️ This file is large and may take long to upload/process. Continue?')) return;
     }
     setSelectedFile(file);
     setResultsVisible(false);
-    if (previewVideoRef.current) {
-      previewVideoRef.current.src = URL.createObjectURL(file);
-    }
+    if (previewVideoRef.current) previewVideoRef.current.src = URL.createObjectURL(file);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -174,21 +225,13 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
   useEffect(() => {
     const dz = dropZoneRef.current;
     if (!dz) return;
-
-    const onDragOver = (e: DragEvent) => {
-      e.preventDefault();
-      dz.classList.add('dragover');
-    };
-    const onDragLeave = () => {
-      dz.classList.remove('dragover');
-    };
-    const onDrop = (e: DragEvent) => {
-      e.preventDefault();
-      dz.classList.remove('dragover');
+    const onDragOver  = (e: DragEvent) => { e.preventDefault(); dz.classList.add('dragover'); };
+    const onDragLeave = () => dz.classList.remove('dragover');
+    const onDrop      = (e: DragEvent) => {
+      e.preventDefault(); dz.classList.remove('dragover');
       const file = e.dataTransfer?.files?.[0];
       if (file) onFileChosen(file);
     };
-
     dz.addEventListener('dragover', onDragOver);
     dz.addEventListener('dragleave', onDragLeave);
     dz.addEventListener('drop', onDrop);
@@ -221,214 +264,154 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       setIsCameraActive(true);
       if (cameraVideoRef.current) {
         cameraVideoRef.current.srcObject = stream;
-
-        const videoEl = cameraVideoRef.current;
-        videoEl.onloadedmetadata = async () => {
-          try {
-            await videoEl.play();
-          } catch (e) {
-            console.warn('Camera preview play() failed:', e);
-          }
+        cameraVideoRef.current.onloadedmetadata = async () => {
+          try { await cameraVideoRef.current!.play(); } catch (e) { console.warn(e); }
         };
       }
 
-      // Initialize Socket.IO connection for real-time streaming
-      const newSocket = io(apiUrl || 'http://localhost:5000', {
-        transports: ['polling'],
-        upgrade: false,
-      });
-      newSocket.on('connect', () => {
-        console.log('Connected to backend for streaming');
-      });
-
+      const newSocket = io(apiUrl || 'http://localhost:5000', { transports: ['polling'], upgrade: false });
+      newSocket.on('connect', () => console.log('Connected to backend for streaming'));
       newSocket.on('analysis_result', (data) => {
-        setRealTimeAnalysis((prev: any[]) => [...prev.slice(-4), data]); // Keep last 5 results
+        setRealTimeAnalysis((prev: any[]) => [...prev.slice(-4), data]);
       });
-
-      newSocket.on('stream_error', (data) => {
-        console.error('Streaming error:', data.error);
-      });
-
+      newSocket.on('stream_error', (data) => console.error('Streaming error:', data.error));
       setSocket(newSocket);
       socketRef.current = newSocket;
     } catch (err: any) {
       alert(`⚠️ Error accessing camera: ${err.message || 'Camera access denied'}`);
-      console.error('Camera access error:', err);
     }
   };
 
   const stopCamera = () => {
     if (mediaStream) {
-      mediaStream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
+      mediaStream.getTracks().forEach((t: MediaStreamTrack) => t.stop());
       setMediaStream(null);
       setIsCameraActive(false);
-      if (cameraVideoRef.current) {
-        cameraVideoRef.current.srcObject = null;
-      }
+      if (cameraVideoRef.current) cameraVideoRef.current.srcObject = null;
     }
-
-    if (streamingIntervalRef.current) {
-      clearInterval(streamingIntervalRef.current);
-      streamingIntervalRef.current = null;
-    }
+    if (streamingIntervalRef.current) { clearInterval(streamingIntervalRef.current); streamingIntervalRef.current = null; }
     frameCounterRef.current = 0;
-
-    // Disconnect socket
-    if (socket) {
-      socket.disconnect();
-      setSocket(null);
-    }
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-      socketRef.current = null;
-    }
-
+    if (socket) { socket.disconnect(); setSocket(null); }
+    if (socketRef.current) { socketRef.current.disconnect(); socketRef.current = null; }
     setIsRecording(false);
     setIsStreaming(false);
     setRecordingTime(0);
     setRealTimeAnalysis([]);
     setLivePredictions([]);
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
+    if (recordingIntervalRef.current) { clearInterval(recordingIntervalRef.current); recordingIntervalRef.current = null; }
+    if ('speechSynthesis' in window) speechSynthesis.cancel();
+    ttsQueue.length = 0;
+    ttsBusy = false;
+    lastSpeechTimeRef.current = 0;
   };
 
-  const speakPrediction = (answer: string) => {
-    if ('speechSynthesis' in window) {
-      const text = `${answer} `;
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'en-US';
-      utterance.rate = 0.9;
-      utterance.pitch = 1;
-      utterance.volume = 1;
-      speechSynthesis.speak(utterance);
-    }
-  };
-
+  // ── Frame streaming ──────────────────────────────────────────
+  // FIX (doc-3): Send realtime:true so backend can apply scene sampling logic.
+  // FIX (doc-3 scene): Backend now samples Florence-2 every ~5s even in
+  // realtime mode, so scene_change events will arrive here naturally.
+  // The frontend just needs to handle the new "scene" tier in speakEvent.
   const startFrameStreaming = () => {
     if (!cameraVideoRef.current || !apiUrl) return;
-
-    if (streamingIntervalRef.current) {
-      clearInterval(streamingIntervalRef.current);
-      streamingIntervalRef.current = null;
-    }
-
+    if (streamingIntervalRef.current) { clearInterval(streamingIntervalRef.current); streamingIntervalRef.current = null; }
     frameCounterRef.current = 0;
+
+    // Reset backend spatial memory for a fresh session
+    fetch(`${apiUrl}/session/reset`, { method: 'POST' }).catch(() => {});
 
     streamingIntervalRef.current = window.setInterval(async () => {
       const videoEl = cameraVideoRef.current;
-      if (!videoEl) return;
-      if (videoEl.readyState < 2) return;
-      if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) return;
+      if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) return;
 
       const canvas = captureCanvasRef.current ?? document.createElement('canvas');
       captureCanvasRef.current = canvas;
-
-      canvas.width = videoEl.videoWidth;
+      canvas.width  = videoEl.videoWidth;
       canvas.height = videoEl.videoHeight;
-
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-
       ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
 
-      const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.7);
-      const base64Data = jpegDataUrl.split(',')[1];
-      
       try {
         const response = await fetch(`${apiUrl}/analyze/image`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image_data: base64Data,
-          mode: 'comprehensive',
-          detail_level: 'detailed',
-        }),
-      });
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image_data:  canvas.toDataURL('image/jpeg', 0.7).split(',')[1],
+            mode:        'comprehensive',
+            detail_level:'detailed',
+            realtime:    true,  // FIX (doc-3 scene): tells backend to use sampled Florence-2
+          }),
+        });
 
-      const result = await response.json();
-      console.log('Frame analysis result:', result);
-      
-      // result from /analyze/image wraps data in result.results
-      const data = result.results ?? result; // ← handle both shapes
-      
-      if (data.description || data.navigation_description) {
-        const navDesc = data.navigation_description ?? data.description ?? '';
-      
-        const objectNavs = (data.objects ?? [])
-          .slice(0, 5)
-          .map((obj: any) => obj.navigation_description)
-          .filter(Boolean);
-      
-        const combinedText = [navDesc, ...objectNavs].filter(Boolean).join('. ');
-      
-        setLivePredictions((prev: string[]) => [...prev.slice(-4), combinedText]);
-        speakPrediction(combinedText);
-      } else {
-        console.error('Frame analysis error:', result);
-      }
+        const data = await response.json();
+
+        const events: SpeechEvent[] = data.speech_events ?? [];
+
+        if (events.length > 0) {
+          const now = Date.now();
+
+          // FIX (doc-3): Client-side silence gap guard — mirrors backend MIN_SILENCE_GAP
+          const gapOk = (now - lastSpeechTimeRef.current) >= MIN_SPEECH_GAP_MS;
+
+          // Danger bypasses the gap check (it's already interrupt=true)
+          // FIX (doc-3 scene): scene tier also bypasses gap — it fires rarely (every 5s+)
+          const hasDanger = events.some((e) => e.tier === 'danger');
+          const hasScene  = events.some((e) => e.tier === 'scene');
+
+          if (hasDanger || hasScene || gapOk) {
+            // Update the live predictions log
+            setLivePredictions((prev) => [
+              ...prev.slice(-9),
+              ...events.map((e) => ({ tier: e.tier, text: e.text, ts: now })),
+            ]);
+
+            for (const evt of events) {
+              speakEvent(evt.tier, evt.text, evt.interrupt, evt.urgency);
+            }
+
+            lastSpeechTimeRef.current = now;
+          }
+        }
       } catch (err) {
         console.error('Frame analysis error:', err);
       }
-    }, 2000);
+    }, 2000); // 2 s — polite to GPU and matches ALERT_DEBOUNCE
   };
 
   const startRecording = () => {
-    if (!mediaStream) {
-      alert('⚠️ Please start camera first');
-      return;
-    }
-
+    if (!mediaStream) { alert('⚠️ Please start camera first'); return; }
     const videoEl = cameraVideoRef.current;
-    if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-      alert('⚠️ Camera is still starting. Please wait a second and try again.');
-      return;
+    if (!videoEl || videoEl.readyState < 2 || videoEl.videoWidth === 0) {
+      alert('⚠️ Camera is still starting. Please wait a second and try again.'); return;
     }
 
-    const chunks: Blob[] = [];
-    recordedChunksRef.current = chunks;
-    setRecordedChunks(chunks);
+    recordedChunksRef.current = [];
+    setRecordedChunks([]);
 
     try {
       let options: MediaRecorderOptions = {};
-      const mimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
-      for (const mimeType of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mimeType)) {
-          options = { mimeType };
-          break;
-        }
+      for (const mt of ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4']) {
+        if (MediaRecorder.isTypeSupported(mt)) { options = { mimeType: mt }; break; }
       }
 
       const mediaRecorder = new MediaRecorder(mediaStream, options);
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event: BlobEvent) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
+        if (event.data.size > 0) recordedChunksRef.current.push(event.data);
       };
-
       mediaRecorder.onstop = () => {
-        const mimeType = mediaRecorder.mimeType || 'video/webm';
+        const mimeType  = mediaRecorder.mimeType || 'video/webm';
         const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
-        const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-        if (blob.size === 0) {
-          alert('⚠️ Recording was empty. Please try again (record for at least 2 seconds).');
-          return;
-        }
-        const fileName = `recording-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
-        const file = new File([blob], fileName, { type: mimeType });
+        const blob      = new Blob(recordedChunksRef.current, { type: mimeType });
+        if (blob.size === 0) { alert('⚠️ Recording was empty. Please try again.'); return; }
+        const file = new File([blob], `recording-${Date.now()}.${extension}`, { type: mimeType });
         onFileChosen(file);
       };
 
-      // Use a timeslice so the first session produces early chunks.
       mediaRecorder.start(500);
-
       setIsRecording(true);
       setIsStreaming(true);
       setRecordingTime(0);
-
       startFrameStreaming();
 
       recordingIntervalRef.current = window.setInterval(() => {
@@ -436,70 +419,35 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       }, 1000);
     } catch (err: any) {
       alert(`⚠️ Error starting recording: ${err.message || 'Recording failed'}`);
-      console.error('Recording error:', err);
     }
   };
 
   const stopRecording = () => {
     const mr = mediaRecorderRef.current;
     if (!mr || !isRecording) return;
-
-    try {
-      mr.requestData();
-    } catch {}
-
-    window.setTimeout(() => {
-      try {
-        mr.stop();
-      } catch {}
-    }, 200);
+    try { mr.requestData(); } catch {}
+    window.setTimeout(() => { try { mr.stop(); } catch {} }, 200);
 
     setIsRecording(false);
     setIsStreaming(false);
-
-    if (recordingIntervalRef.current) {
-      clearInterval(recordingIntervalRef.current);
-      recordingIntervalRef.current = null;
-    }
-
-    if (streamingIntervalRef.current) {
-      clearInterval(streamingIntervalRef.current);
-      streamingIntervalRef.current = null;
-    }
+    if (recordingIntervalRef.current)  { clearInterval(recordingIntervalRef.current);  recordingIntervalRef.current = null; }
+    if (streamingIntervalRef.current)  { clearInterval(streamingIntervalRef.current);  streamingIntervalRef.current = null; }
+    if ('speechSynthesis' in window)   speechSynthesis.cancel();
+    ttsQueue.length = 0;
+    ttsBusy = false;
+    lastSpeechTimeRef.current = 0;
   };
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopCamera();
-    };
-  }, []);
+  useEffect(() => { return () => { stopCamera(); }; }, []);
 
-  const showStatus = (message: string, type: StatusType) => {
-    setStatusMessage(message);
-    setStatusType(type);
-  };
-
-  const showProgress = (percent: number, label?: string) => {
-    setProgressVisible(true);
-    setProgressPercent(percent);
-    if (label) setProgressLabel(label);
-  };
-
-  const hideProgress = () => {
-    setProgressVisible(false);
-  };
+  const showStatus   = (message: string, type: StatusType) => { setStatusMessage(message); setStatusType(type); };
+  const showProgress = (percent: number, label?: string)   => { setProgressVisible(true); setProgressPercent(percent); if (label) setProgressLabel(label); };
+  const hideProgress = () => setProgressVisible(false);
 
   const analyzeVideo = async () => {
-    if (!selectedFile) {
-      alert('⚠️ Please select a video file first');
-      return;
-    }
+    if (!selectedFile) { alert('⚠️ Please select a video file first'); return; }
     const url = apiUrl.trim();
-    if (!url) {
-      alert('⚠️ Please enter your backend API URL (e.g., http://localhost:5000)');
-      return;
-    }
+    if (!url) { alert('⚠️ Please enter your backend API URL'); return; }
 
     try {
       setResultsVisible(false);
@@ -516,10 +464,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
       const xhr = new XMLHttpRequest();
 
       xhr.upload.addEventListener('progress', (e) => {
-        if (e.lengthComputable) {
-          const percentComplete = (e.loaded / e.total) * 50;
-          showProgress(percentComplete, 'Uploading video...');
-        }
+        if (e.lengthComputable) showProgress((e.loaded / e.total) * 50, 'Uploading video...');
       });
 
       xhr.addEventListener('load', () => {
@@ -532,33 +477,24 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
           setResultsVisible(true);
         } else {
           let errorMsg = 'Unknown error';
-          try {
-            errorMsg = (JSON.parse(xhr.responseText).error as string) || errorMsg;
-          } catch {}
+          try { errorMsg = (JSON.parse(xhr.responseText).error as string) || errorMsg; } catch {}
           showStatus(`❌ Error: ${errorMsg}`, 'error');
           hideProgress();
         }
       });
 
       xhr.addEventListener('error', () => {
-        showStatus('❌ Network error occurred. Please check your connection and try again.', 'error');
+        showStatus('❌ Network error. Please check your connection and try again.', 'error');
         hideProgress();
       });
 
       xhr.upload.addEventListener('loadend', () => {
         showProgress(50, 'Processing video frames...');
         showStatus('⏳ Processing video frames with AI models... This may take several minutes.', 'loading');
-
         let progress = 50;
         const interval = setInterval(() => {
-          if (xhr.readyState === 4) {
-            clearInterval(interval);
-          } else {
-            progress += 2;
-            if (progress < 95) {
-              showProgress(progress, 'Analyzing frames...');
-            }
-          }
+          if (xhr.readyState === 4) { clearInterval(interval); }
+          else { progress += 2; if (progress < 95) showProgress(progress, 'Analyzing frames...'); }
         }, 2000);
       });
 
@@ -574,6 +510,23 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
     if (!startTimeRef.current || !resultsVisible) return '-';
     return `${((Date.now() - startTimeRef.current) / 1000).toFixed(1)}s`;
   }, [resultsVisible]);
+
+  // ── Tier label helpers ────────────────────────────────────
+  // FIX (doc-3 scene): added "scene" tier with its own colour + icon
+  const tierColor = (tier: string) => {
+    if (tier === 'danger')  return 'text-red-700 font-bold';
+    if (tier === 'alert')   return 'text-orange-600 font-semibold';
+    if (tier === 'scene')   return 'text-purple-700 font-semibold';  // NEW
+    if (tier === 'ambient') return 'text-green-700';
+    return 'text-blue-700';
+  };
+  const tierIcon = (tier: string) => {
+    if (tier === 'danger')  return '🚨';
+    if (tier === 'alert')   return '⚠️';
+    if (tier === 'scene')   return '🏞️';  // NEW
+    if (tier === 'ambient') return '🔵';
+    return '💬';
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-400 to-purple-600 p-5">
@@ -595,6 +548,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
         </div>
 
         <div className="p-6 md:p-10">
+          {/* API Config */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-4">⚙️ API Configuration</h2>
             <div className="grid md:grid-cols-2 gap-4">
@@ -614,14 +568,14 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               <div className="bg-cyan-50 border-l-4 border-cyan-500 p-4 rounded">
                 <strong className="block text-cyan-900 mb-1">💡 Examples:</strong>
                 <div className="text-cyan-900">
-                  Local: http://localhost:5000
-                  <br />
+                  Local: http://localhost:5000<br />
                   Ngrok: https://xxxx-xx-xxx-xxx-xxx.ngrok-free.app
                 </div>
               </div>
             </div>
           </div>
 
+          {/* Camera + Upload Section */}
           <div className="mb-8 p-6 rounded-xl bg-gray-50 border-l-4 border-indigo-500">
             <h2 className="text-2xl font-semibold text-indigo-600 mb-6">📹 Upload or Record Video</h2>
 
@@ -649,9 +603,8 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                       playsInline
                       muted
                       className="w-full max-h-[400px] block object-cover"
-                      style={{ transform: 'scaleX(-1)' }} // Mirror effect for natural camera view
+                      style={{ transform: 'scaleX(-1)' }}
                     />
-
                     {isRecording && (
                       <div className="absolute top-4 left-4 bg-red-600 text-white px-4 py-2 rounded-full flex items-center gap-2 font-semibold z-10">
                         <span className="w-3 h-3 bg-white rounded-full animate-pulse" />
@@ -665,36 +618,34 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     )}
                   </div>
 
-                  {/* New Live Predictions Box */}
+                  {/* Live Predictions */}
                   <div className="p-4 rounded-xl bg-yellow-50 border-2 border-yellow-300 text-yellow-900">
-                    <div className="font-semibold mb-2">Live Predictions</div>
-                    <div className="space-y-1 max-h-[140px] overflow-y-auto">
+                    <div className="font-semibold mb-2 flex items-center gap-2">
+                      Live Assistant
+                      <span className="text-xs font-normal text-yellow-700">(only meaningful events are spoken)</span>
+                    </div>
+                    {/* FIX (doc-3 scene): Legend now includes "scene" tier */}
+                    <div className="flex flex-wrap gap-3 mb-2 text-xs">
+                      <span className="text-red-700 font-bold">🚨 danger</span>
+                      <span className="text-purple-700 font-semibold">🏞️ scene change</span>
+                      <span className="text-orange-600 font-semibold">⚠️ alert</span>
+                      <span className="text-green-700">🔵 ambient</span>
+                    </div>
+                    <div className="space-y-1 max-h-[160px] overflow-y-auto">
                       {livePredictions.length === 0 ? (
-                        <div className="text-yellow-700 text-sm">Start recording to see predictions...</div>
+                        <div className="text-yellow-700 text-sm">Start recording to see assistant events...</div>
                       ) : (
-                        livePredictions.slice(-8).reverse().map((answer, idx) => (
-                          <div key={idx} className="font-semibold">
-                            {answer} ahead.
+                        [...livePredictions].reverse().map((evt, idx) => (
+                          <div key={idx} className={`text-sm flex items-start gap-2 ${tierColor(evt.tier)}`}>
+                            <span>{tierIcon(evt.tier)}</span>
+                            <span>{evt.text}</span>
                           </div>
                         ))
                       )}
                     </div>
                   </div>
 
-                  {(() => {
-                    const latest = realTimeAnalysis[realTimeAnalysis.length - 1];
-                    if (!latest) return null;
-                    if (latest.error) {
-                      return (
-                        <div className="p-4 rounded-xl bg-red-50 border-2 border-red-300 text-red-800 font-semibold">
-                          {latest.error}
-                        </div>
-                      );
-                    }
-                    return null;
-                  })()}
-
-                  {/* Real-time Analysis Results */}
+                  {/* Real-time socket analysis (debugging) */}
                   {realTimeAnalysis.length > 0 && (
                     <div className="p-4 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-300">
                       <h4 className="text-lg font-semibold text-blue-700 mb-3">🔍 Real-time Analysis</h4>
@@ -704,9 +655,6 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                             <div className="text-sm text-gray-600 mb-1">
                               {new Date(analysis.timestamp).toLocaleTimeString()}
                             </div>
-                            {analysis.question && (
-                              <div className="text-xs text-blue-700 font-semibold mb-1">Q: {analysis.question}</div>
-                            )}
                             {analysis.answer && (
                               <div className="text-sm text-gray-900 font-semibold">A: {analysis.answer}</div>
                             )}
@@ -748,7 +696,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               )}
             </div>
 
-            {/* File Upload Section */}
+            {/* File Upload */}
             <div className="mb-4">
               <h3 className="text-xl font-semibold text-indigo-600 mb-4">📁 Or Upload Video File</h3>
               <div
@@ -769,18 +717,13 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                 <div className="grid grid-cols-[auto_1fr] gap-2 items-center">
                   <span className="font-semibold text-green-800">📄 File Name:</span>
                   <span className="text-green-800">{selectedFile.name}</span>
-
                   <span className="font-semibold text-green-800">💾 File Size:</span>
                   <span className="text-green-800">
-                    {selectedFile.size < 1024
-                      ? `${selectedFile.size} B`
-                      : selectedFile.size < 1024 * 1024
-                      ? `${(selectedFile.size / 1024).toFixed(2)} KB`
-                      : selectedFile.size < 1024 * 1024 * 1024
-                      ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB`
-                      : `${(selectedFile.size / (1024 * 1024 * 1024)).toFixed(2)} GB`}
+                    {selectedFile.size < 1024 ? `${selectedFile.size} B`
+                      : selectedFile.size < 1024 * 1024 ? `${(selectedFile.size / 1024).toFixed(2)} KB`
+                      : selectedFile.size < 1024 ** 3 ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB`
+                      : `${(selectedFile.size / 1024 ** 3).toFixed(2)} GB`}
                   </span>
-
                   <span className="font-semibold text-green-800">🎞️ Format:</span>
                   <span className="text-green-800">{selectedFile.type.split('/')[1]?.toUpperCase() || '-'}</span>
                 </div>
@@ -797,10 +740,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               <div>
                 <label className="block mb-2 font-semibold text-gray-700">Duration to Process (seconds)</label>
                 <input
-                  type="number"
-                  min={5}
-                  max={300}
-                  value={duration}
+                  type="number" min={5} max={300} value={duration}
                   onChange={(e) => setDuration(e.target.value)}
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                   placeholder="Leave empty for full video"
@@ -810,10 +750,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
               <div>
                 <label className="block mb-2 font-semibold text-gray-700">Number of Frame Analyses</label>
                 <input
-                  type="number"
-                  min={3}
-                  max={50}
-                  value={targetAnalyses}
+                  type="number" min={3} max={50} value={targetAnalyses}
                   onChange={(e) => setTargetAnalyses(e.target.value)}
                   className="w-full rounded-lg border-2 border-gray-200 px-3 py-2 focus:outline-none focus:border-indigo-500"
                 />
@@ -832,9 +769,7 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                     <span className="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
                     Processing...
                   </span>
-                ) : (
-                  'Analyze Video'
-                )}
+                ) : 'Analyze Video'}
               </button>
               {selectedFile && (
                 <button
@@ -866,65 +801,47 @@ export default function VideoAnalyzer({ onBack }: VideoAnalyzerProps) {
                   'mt-4 rounded-xl p-4 font-semibold',
                   statusType === 'loading' && 'bg-yellow-100 text-yellow-800 border-2 border-yellow-300',
                   statusType === 'success' && 'bg-green-100 text-green-800 border-2 border-green-300',
-                  statusType === 'error' && 'bg-red-100 text-red-800 border-2 border-red-300',
-                ]
-                  .filter(Boolean)
-                  .join(' ')}
+                  statusType === 'error'   && 'bg-red-100 text-red-800 border-2 border-red-300',
+                ].filter(Boolean).join(' ')}
               >
                 {statusMessage}
               </div>
             )}
           </div>
 
+          {/* Results */}
           {resultsVisible && results && (
             <div className="rounded-xl border-2 border-indigo-500 p-6 bg-white shadow">
-              <h3 className="text-2xl font-semibold text-indigo-600 mb-4 flex items-center gap-2">📊 Analysis Results</h3>
+              <h3 className="text-2xl font-semibold text-indigo-600 mb-4">📊 Analysis Results</h3>
 
               {videoInfo && (
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Total Frames Analyzed</div>
-                    <div className="text-2xl font-bold text-indigo-600">{videoInfo.analyzed_frames ?? '-'}</div>
-                  </div>
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Video Duration</div>
-                    <div className="text-2xl font-bold text-indigo-600">{videoInfo.total_duration ?? '-'}</div>
-                  </div>
-                  <div className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
-                    <div className="text-gray-600 text-sm">Processing Time</div>
-                    <div className="text-2xl font-bold text-indigo-600">{processingTime}</div>
-                  </div>
+                  {[
+                    ['Total Frames Analyzed', videoInfo.analyzed_frames ?? '-'],
+                    ['Video Duration',         videoInfo.total_duration  ?? '-'],
+                    ['Processing Time',        processingTime],
+                  ].map(([label, value]) => (
+                    <div key={label as string} className="p-4 rounded-lg bg-gradient-to-br from-gray-50 to-gray-100 border-l-4 border-indigo-500">
+                      <div className="text-gray-600 text-sm">{label}</div>
+                      <div className="text-2xl font-bold text-indigo-600">{value}</div>
+                    </div>
+                  ))}
                 </div>
               )}
 
               <div className="flex gap-2 border-b border-gray-200 mb-4">
-                <button
-                  onClick={() => setActiveTab('summary')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'summary' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  📋 Summary
-                </button>
-                <button
-                  onClick={() => setActiveTab('frames')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'frames' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  🎞️ Frame Analysis
-                </button>
-                <button
-                  onClick={() => setActiveTab('raw')}
-                  className={[
-                    'px-4 py-2 font-semibold border-b-2',
-                    activeTab === 'raw' ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
-                  ].join(' ')}
-                >
-                  📄 Raw Data
-                </button>
+                {(['summary', 'frames', 'raw'] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => setActiveTab(tab)}
+                    className={[
+                      'px-4 py-2 font-semibold border-b-2',
+                      activeTab === tab ? 'text-indigo-600 border-indigo-600' : 'text-gray-600 border-transparent',
+                    ].join(' ')}
+                  >
+                    {tab === 'summary' ? '📋 Summary' : tab === 'frames' ? '🎞️ Frame Analysis' : '📄 Raw Data'}
+                  </button>
+                ))}
               </div>
 
               {activeTab === 'summary' && (
